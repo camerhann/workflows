@@ -11,15 +11,63 @@ Automate GitHub issue resolution with a 4-agent AI pipeline powered by Claude.
 When you label a GitHub issue with `agent`, this pipeline automatically:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  1. ISSUE ANALYST    →  Researches codebase, creates brief     │
-│  2. WRITER AGENT     →  Makes minimal, surgical code changes   │
-│  3. REVIEWER AGENT   →  Runs tests/lint, approves or rejects   │
-│  4. COMMITTER AGENT  →  Creates PR to develop branch           │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│  1. ISSUE ANALYST       →  Researches codebase, creates brief            │
+│  2. WRITER-REVIEWER     →  Makes changes, reviews, RETRIES if rejected   │
+│     LOOP (up to 3x)        (Ralph-style self-correction)                 │
+│  3. COMMITTER AGENT     →  Creates PR to develop branch                  │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 **You review the PR and merge when ready.** The agent does the work, you stay in control.
+
+---
+
+## 🔄 Ralph-Style Retry Loop (NEW!)
+
+Inspired by the [Ralph Wiggum technique](https://ghuntley.com/ralph/), this pipeline now features **self-correcting agents**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  WRITER-REVIEWER LOOP                       │
+│                                                             │
+│   Attempt 1:                                                │
+│     Writer ──→ code changes                                 │
+│     Reviewer ──→ ❌ REJECTED: "Missing error handling"      │
+│                         │                                   │
+│   Attempt 2:            ▼ (feedback passed to Writer)       │
+│     Writer ──→ improved code (addresses feedback)           │
+│     Reviewer ──→ ❌ REJECTED: "Doesn't match pattern"       │
+│                         │                                   │
+│   Attempt 3:            ▼                                   │
+│     Writer ──→ final improvements                           │
+│     Reviewer ──→ ✅ APPROVED                                │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Key Features
+
+| Feature | Description |
+|---------|-------------|
+| **Retry Loop** | Writer gets up to 3 attempts to produce approved code |
+| **Feedback Flow** | Rejection reasons are passed back to Writer for next attempt |
+| **Promise Signals** | Agents use `<promise>` tags for clear completion signals |
+| **Iteration Tracking** | PR body shows how many attempts were needed |
+| **Graceful Failure** | If all attempts fail, helpful feedback posted to issue |
+
+### Promise Signals
+
+Each agent outputs explicit completion signals:
+
+```
+<promise>ANALYSIS_COMPLETE</promise>     # Analyst finished research
+<promise>ANALYSIS_BLOCKED: reason</promise>  # Analyst can't proceed
+<promise>CHANGES_READY</promise>         # Writer finished coding
+<promise>APPROVED</promise>              # Reviewer approves
+<promise>REJECTED: feedback</promise>    # Reviewer rejects with feedback
+<promise>PR_CREATED</promise>            # Committer finished
+```
 
 ---
 
@@ -72,15 +120,14 @@ git push
 ```
 workflows/
 ├── .github/workflows/
-│   └── issue-agent.yml       # Central reusable workflow
-├── agents/                    # Agent definitions
+│   └── issue-agent.yml       # Central reusable workflow (with Ralph-style loop)
+├── agents/                    # Agent definitions (for local CLI use)
 │   ├── issue-analyst.md      # Research & analysis
 │   ├── pr-writer.md          # Code changes
 │   ├── pr-reviewer.md        # Quality gate
 │   └── pr-committer.md       # Commit & PR
 ├── repo-setup/
-│   ├── issue-agent-caller.yml  # Copy this to your repos
-│   └── install.sh              # Installation script
+│   └── issue-agent-caller.yml  # Copy this to your repos
 └── README.md
 ```
 
@@ -95,30 +142,34 @@ workflows/
 - Researches your codebase for relevant files
 - Identifies existing patterns to follow
 - Creates a structured brief with Must Do / Must NOT Do
+- Outputs `<promise>ANALYSIS_COMPLETE</promise>` or `<promise>ANALYSIS_BLOCKED: reason</promise>`
 
-### 2. Writer Agent
+### 2. Writer-Reviewer Loop (Ralph-Style)
+> *"Self-correction through iteration."*
+
+**Writer Agent:**
 > *"The best code change is the smallest one that solves the problem."*
 
 - Studies existing code patterns BEFORE writing
 - Makes minimal, surgical changes
-- Respects your codebase - doesn't "improve" unrelated code
-- Self-reviews for minimalism
+- On retry: receives and addresses reviewer feedback
+- Outputs `<promise>CHANGES_READY</promise>`
 
-### 3. Reviewer Agent
+**Reviewer Agent:**
 > *"Nothing gets through unless it's verified."*
 
-- Runs your tests
-- Runs linting/type checks
-- Evaluates if the solution actually solves the issue
-- **REJECTS** if anything fails → sends back to Writer
+- Reviews code changes for bugs, security, patterns
+- If issues found: outputs `<promise>REJECTED: specific feedback</promise>`
+- If all good: outputs `<promise>APPROVED</promise>`
+- **On rejection, Writer gets another attempt with the feedback!**
 
-### 4. Committer Agent
+### 3. Committer Agent
 > *"Only approved, tested code gets committed."*
 
 - Verifies Reviewer approved
 - Generates smart commit message based on changes
 - Creates PR targeting `develop` branch
-- You merge to `main` when ready
+- PR body shows iteration count (e.g., "Approved after 2 attempts")
 
 ---
 
@@ -148,6 +199,12 @@ agent/issue-X ← Agent creates these branches
 |--------|-------------|
 | `ANTHROPIC_API_KEY` | Your Claude API key from [console.anthropic.com](https://console.anthropic.com) |
 
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_WRITER_ATTEMPTS` | `3` | Maximum retry attempts for Writer-Reviewer loop |
+
 ### Triggers
 
 The workflow triggers when:
@@ -165,6 +222,15 @@ The workflow triggers when:
 3. Update `repo-setup/issue-agent-caller.yml` to point to your fork
 4. Customize agent prompts in the workflow
 
+### Adjusting Retry Behavior
+
+Change the max attempts by editing the env variable:
+
+```yaml
+env:
+  MAX_WRITER_ATTEMPTS: 5  # Increase to 5 attempts
+```
+
 ### Agent Philosophies
 
 The agents follow specific philosophies defined in their prompts:
@@ -173,7 +239,7 @@ The agents follow specific philosophies defined in their prompts:
 |-------|------------|
 | Analyst | Research first, clear briefs, no guessing |
 | Writer | Minimal changes, respect existing patterns |
-| Reviewer | Verify everything, reject failures |
+| Reviewer | Verify everything, provide actionable feedback |
 | Committer | Smart commits, proper PR workflow |
 
 You can modify these in the workflow file to match your team's style.
@@ -218,6 +284,35 @@ Copy the agent files from `agents/` to `~/.claude/commands/` for local use.
 - Check your issue description - be specific about what you want
 - Add "Must NOT change" instructions to your issue
 
+### Pipeline failing after all retries?
+- Check the issue comment for the final feedback
+- Simplify the issue requirements
+- Break into smaller, more focused issues
+- Add more specific acceptance criteria
+
+### Analyst blocking?
+- The issue may be too vague
+- Add more context about what needs to change
+- Specify which files or components are involved
+
+---
+
+## 📊 Understanding PR Results
+
+The PR body now shows iteration history:
+
+```markdown
+## Pipeline Results
+- **Issue Analyst:** ✅ Research complete
+- **Writer-Reviewer Loop:** 🔄 Approved after 2 attempts (Ralph-style retry)
+- **Committer Agent:** ✅ PR created
+```
+
+This helps you understand:
+- How much iteration was needed
+- Whether the task was straightforward or required refinement
+- The overall health of your issue descriptions
+
 ---
 
 ## 📄 License
@@ -228,7 +323,8 @@ MIT License - Use freely, modify as needed.
 
 ## 🙏 Credits
 
-Built with [Claude](https://anthropic.com) by Anthropic.
+- Built with [Claude](https://anthropic.com) by Anthropic
+- Inspired by the [Ralph Wiggum technique](https://ghuntley.com/ralph/) by Geoffrey Huntley
 
 ---
 
@@ -239,6 +335,7 @@ Built with [Claude](https://anthropic.com) by Anthropic.
 3. **Mention files if known** - "Check `src/components/Button.tsx`"
 4. **Set boundaries** - "Don't modify the API layer"
 5. **Start small** - Test with simple issues first
+6. **Trust the retry loop** - If first attempt fails, the agent will self-correct!
 
 ---
 

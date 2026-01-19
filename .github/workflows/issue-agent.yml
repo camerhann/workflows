@@ -1,3 +1,4 @@
+# Issue Agent - 4-Agent AI Pipeline with Ralph-Style Retry Loop
 name: Issue Agent (Reusable)
 
 on:
@@ -12,6 +13,9 @@ on:
     secrets:
       ANTHROPIC_API_KEY:
         required: true
+
+env:
+  MAX_WRITER_ATTEMPTS: 3  # Ralph-style iteration limit
 
 jobs:
   work-on-issue:
@@ -55,9 +59,10 @@ jobs:
           gh issue view ${{ github.event.issue.number }} --json title,body > issue.json
 
       # ========================================
-      # STEP 1: ISSUE ANALYST
+      # STEP 1: ISSUE ANALYST (with Promise)
       # ========================================
       - name: Issue Analyst
+        id: analyst
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -65,7 +70,7 @@ jobs:
           ISSUE_TITLE=$(jq -r '.title' issue.json)
           ISSUE_BODY=$(jq -r '.body' issue.json)
 
-          claude --print "
+          OUTPUT=$(claude --print "
           You are the ISSUE ANALYST. Your job is to research the codebase and create a clear brief.
 
           ## Core Philosophy
@@ -91,134 +96,228 @@ jobs:
           - Do NOT modify any source files
           - ONLY create ANALYSIS.md with your findings
           - Be specific - vague briefs lead to wrong solutions
-          "
+
+          ## Completion Signal
+          When ANALYSIS.md is complete and thorough, output exactly:
+          <promise>ANALYSIS_COMPLETE</promise>
+
+          If you cannot complete analysis (missing info, unclear requirements), output:
+          <promise>ANALYSIS_BLOCKED: [reason]</promise>
+          ")
+
+          echo "$OUTPUT"
+
+          # Check for promise signals
+          if echo "$OUTPUT" | grep -q "<promise>ANALYSIS_COMPLETE</promise>"; then
+            echo "status=complete" >> $GITHUB_OUTPUT
+          elif echo "$OUTPUT" | grep -q "<promise>ANALYSIS_BLOCKED"; then
+            BLOCK_REASON=$(echo "$OUTPUT" | grep -o '<promise>ANALYSIS_BLOCKED: [^<]*</promise>' | sed 's/<[^>]*>//g')
+            echo "status=blocked" >> $GITHUB_OUTPUT
+            echo "reason=$BLOCK_REASON" >> $GITHUB_OUTPUT
+          else
+            echo "status=complete" >> $GITHUB_OUTPUT  # Default to complete for backwards compat
+          fi
+
+      - name: Handle Analyst Block
+        if: steps.analyst.outputs.status == 'blocked'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment ${{ env.ISSUE_NUMBER }} --body "🤖 **Issue Analyst Blocked**
+
+          Could not complete analysis:
+          > ${{ steps.analyst.outputs.reason }}
+
+          Please provide more details in the issue description."
+          exit 1
 
       # ========================================
-      # STEP 2: WRITER AGENT
+      # STEP 2 & 3: WRITER-REVIEWER RETRY LOOP
+      # Ralph-style iteration with feedback
       # ========================================
-      - name: Writer Agent
+      - name: Writer-Reviewer Loop
+        id: write_review
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           ISSUE_TITLE=$(jq -r '.title' issue.json)
           ISSUE_BODY=$(jq -r '.body' issue.json)
 
-          # Read analysis if it exists
+          # Read analysis
           ANALYSIS=""
           if [[ -f ANALYSIS.md ]]; then
             ANALYSIS=$(cat ANALYSIS.md)
           fi
 
-          claude --print "
-          You are the WRITER AGENT. Your job is to make SURGICAL, MINIMAL changes.
+          # Initialize feedback for first iteration
+          PREVIOUS_FEEDBACK=""
+          ATTEMPT=1
+          APPROVED=false
 
-          ## Core Philosophy
-          The best code change is the smallest one that solves the problem.
-          - The existing codebase is the authority - learn from it, don't fight it
-          - Every line you add should earn its place
-          - If the existing code does something a certain way, do it that way too
+          # ====== RALPH-STYLE RETRY LOOP ======
+          while [[ $ATTEMPT -le ${{ env.MAX_WRITER_ATTEMPTS }} ]]; do
+            echo "=========================================="
+            echo "🔄 ATTEMPT $ATTEMPT of ${{ env.MAX_WRITER_ATTEMPTS }}"
+            echo "=========================================="
 
-          ## Issue #${{ env.ISSUE_NUMBER }}
-          **Title:** $ISSUE_TITLE
-          **Description:** $ISSUE_BODY
-
-          ## Analysis from Issue Analyst
-          $ANALYSIS
-
-          ## Your Tasks
-          1. Study the existing code patterns BEFORE writing anything
-          2. Make the MINIMUM viable change that solves the issue
-          3. Match existing code style exactly
-          4. Save your changes (do NOT commit)
-
-          ## Constraints
-          - Do NOT commit your changes
-          - Do NOT refactor existing code unless required
-          - Do NOT add features beyond what the issue requests
-          - Do NOT improve code style in files you're touching
-          - When in doubt, do less
-
-          ## Self-Review Checklist (verify before finishing)
-          - Are changes the smallest possible?
-          - Did you follow existing patterns?
-          - Does your code look like it belongs?
-          "
-
-          # Clean up analysis file
-          rm -f ANALYSIS.md
-
-      # ========================================
-      # STEP 3: REVIEWER AGENT
-      # ========================================
-      - name: Reviewer Agent
-        id: review
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          git diff > changes.diff
-
-          if [[ ! -s changes.diff ]]; then
-            echo "No changes to review"
-            echo "approved=false" >> $GITHUB_OUTPUT
-            echo "reason=no_changes" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          claude --print "
-          You are the REVIEWER AGENT. You are the QUALITY GATEKEEPER.
-
-          ## Core Philosophy
-          Nothing gets through unless it's verified.
-          - You don't trust - you verify
-          - If anything looks wrong, REJECT immediately
-
-          ## Changes to Review
-          $(cat changes.diff)
-
-          ## Your Tasks
-          1. Review the code changes
-          2. Check for bugs, security issues, logic errors
-          3. Verify changes are minimal and focused
-          4. Check that existing patterns were followed
-
-          ## Judgment
-          Create a file called REVIEW_RESULT.txt containing ONLY one of:
-          - APPROVED
-          - REJECTED: [specific reason]
-
-          ## REJECT if ANY of these are true:
-          - Changes are bloated or unfocused
-          - Bugs or security issues found
-          - Doesn't solve the actual issue
-          - Introduces unnecessary complexity
-
-          ## APPROVE only if ALL are true:
-          - Changes are minimal and focused
-          - Solution solves the issue
-          - No obvious bugs or security issues
-          - Follows existing codebase patterns
-          "
-
-          if [[ -f REVIEW_RESULT.txt ]]; then
-            RESULT=$(cat REVIEW_RESULT.txt)
-            echo "Review result: $RESULT"
-            if [[ "$RESULT" == REJECTED* ]]; then
-              echo "approved=false" >> $GITHUB_OUTPUT
-              echo "reason=$RESULT" >> $GITHUB_OUTPUT
-            else
-              echo "approved=true" >> $GITHUB_OUTPUT
+            # Reset changes if this is a retry
+            if [[ $ATTEMPT -gt 1 ]]; then
+              echo "Resetting changes for retry..."
+              git checkout -- . 2>/dev/null || true
+              git clean -fd 2>/dev/null || true
             fi
-            rm -f REVIEW_RESULT.txt
-          else
-            # Default to approved if no explicit rejection
+
+            # ------ WRITER AGENT ------
+            echo ">>> Running Writer Agent..."
+
+            WRITER_OUTPUT=$(claude --print "
+            You are the WRITER AGENT. Your job is to make SURGICAL, MINIMAL changes.
+
+            ## Iteration Info
+            **Attempt:** $ATTEMPT of ${{ env.MAX_WRITER_ATTEMPTS }}
+            ${PREVIOUS_FEEDBACK:+**Previous Rejection Feedback:** $PREVIOUS_FEEDBACK}
+
+            ## Core Philosophy
+            The best code change is the smallest one that solves the problem.
+            - The existing codebase is the authority - learn from it, don't fight it
+            - Every line you add should earn its place
+            - If the existing code does something a certain way, do it that way too
+            ${PREVIOUS_FEEDBACK:+- **IMPORTANT:** Address the reviewer feedback above!}
+
+            ## Issue #${{ env.ISSUE_NUMBER }}
+            **Title:** $ISSUE_TITLE
+            **Description:** $ISSUE_BODY
+
+            ## Analysis from Issue Analyst
+            $ANALYSIS
+
+            ## Your Tasks
+            1. Study the existing code patterns BEFORE writing anything
+            2. Make the MINIMUM viable change that solves the issue
+            3. Match existing code style exactly
+            4. Save your changes (do NOT commit)
+            ${PREVIOUS_FEEDBACK:+5. **Address reviewer feedback from previous attempt**}
+
+            ## Constraints
+            - Do NOT commit your changes
+            - Do NOT refactor existing code unless required
+            - Do NOT add features beyond what the issue requests
+            - Do NOT improve code style in files you're touching
+            - When in doubt, do less
+
+            ## Self-Review Checklist (verify before finishing)
+            - Are changes the smallest possible?
+            - Did you follow existing patterns?
+            - Does your code look like it belongs?
+            ${PREVIOUS_FEEDBACK:+- Did you address the reviewer feedback?}
+
+            ## Completion Signal
+            When done, output exactly:
+            <promise>CHANGES_READY</promise>
+            ")
+
+            echo "$WRITER_OUTPUT"
+
+            # Check if writer produced changes
+            git diff > changes.diff
+            if [[ ! -s changes.diff ]]; then
+              echo "No changes produced by Writer"
+              ATTEMPT=$((ATTEMPT + 1))
+              PREVIOUS_FEEDBACK="Writer produced no changes. Please make the necessary code modifications."
+              continue
+            fi
+
+            # ------ REVIEWER AGENT ------
+            echo ">>> Running Reviewer Agent..."
+
+            REVIEWER_OUTPUT=$(claude --print "
+            You are the REVIEWER AGENT. You are the QUALITY GATEKEEPER.
+
+            ## Iteration Info
+            **Attempt:** $ATTEMPT of ${{ env.MAX_WRITER_ATTEMPTS }}
+
+            ## Core Philosophy
+            Nothing gets through unless it's verified.
+            - You don't trust - you verify
+            - If anything looks wrong, REJECT with specific, actionable feedback
+            - Your feedback will be given to Writer for the next attempt
+
+            ## Issue Being Solved
+            **Title:** $ISSUE_TITLE
+            **Description:** $ISSUE_BODY
+
+            ## Changes to Review
+            \`\`\`diff
+            $(cat changes.diff)
+            \`\`\`
+
+            ## Your Tasks
+            1. Review the code changes
+            2. Check for bugs, security issues, logic errors
+            3. Verify changes are minimal and focused
+            4. Check that existing patterns were followed
+
+            ## Judgment - Output EXACTLY ONE of these:
+
+            If APPROVED (all criteria met):
+            <promise>APPROVED</promise>
+
+            If REJECTED (any issues found):
+            <promise>REJECTED: [specific, actionable feedback for Writer]</promise>
+
+            ## REJECT if ANY of these are true:
+            - Changes are bloated or unfocused
+            - Bugs or security issues found
+            - Doesn't solve the actual issue
+            - Introduces unnecessary complexity
+            - Doesn't follow existing codebase patterns
+
+            ## APPROVE only if ALL are true:
+            - Changes are minimal and focused
+            - Solution solves the issue
+            - No obvious bugs or security issues
+            - Follows existing codebase patterns
+            ")
+
+            echo "$REVIEWER_OUTPUT"
+
+            # Parse reviewer decision
+            if echo "$REVIEWER_OUTPUT" | grep -q "<promise>APPROVED</promise>"; then
+              echo "✅ APPROVED on attempt $ATTEMPT"
+              APPROVED=true
+              break
+            elif echo "$REVIEWER_OUTPUT" | grep -q "<promise>REJECTED:"; then
+              PREVIOUS_FEEDBACK=$(echo "$REVIEWER_OUTPUT" | grep -o '<promise>REJECTED: [^<]*</promise>' | sed 's/<promise>REJECTED: //' | sed 's/<\/promise>//')
+              echo "❌ REJECTED: $PREVIOUS_FEEDBACK"
+              echo "Will retry with feedback..."
+            else
+              # No clear signal, default to needing another attempt
+              PREVIOUS_FEEDBACK="Reviewer did not provide clear approval. Please ensure changes are minimal and correct."
+              echo "⚠️ Unclear response, retrying..."
+            fi
+
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+          # ====== END RETRY LOOP ======
+
+          # Clean up
+          rm -f ANALYSIS.md changes.diff
+
+          # Set outputs
+          if [[ "$APPROVED" == "true" ]]; then
             echo "approved=true" >> $GITHUB_OUTPUT
+            echo "attempts=$ATTEMPT" >> $GITHUB_OUTPUT
+          else
+            echo "approved=false" >> $GITHUB_OUTPUT
+            echo "attempts=${{ env.MAX_WRITER_ATTEMPTS }}" >> $GITHUB_OUTPUT
+            echo "final_feedback=$PREVIOUS_FEEDBACK" >> $GITHUB_OUTPUT
           fi
 
       # ========================================
-      # STEP 4: COMMITTER AGENT
+      # STEP 4: COMMITTER AGENT (with Promise)
       # ========================================
       - name: Committer Agent
-        if: steps.review.outputs.approved == 'true'
+        if: steps.write_review.outputs.approved == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -229,6 +328,7 @@ jobs:
           fi
 
           ISSUE_TITLE=$(jq -r '.title' issue.json)
+          ATTEMPTS="${{ steps.write_review.outputs.attempts }}"
 
           # Get a smart commit message from Claude
           git diff --staged > /dev/null 2>&1 || git add -A
@@ -249,11 +349,22 @@ jobs:
           - End with: Closes #${{ env.ISSUE_NUMBER }}
 
           Output ONLY the commit message, nothing else.
+          Then output: <promise>COMMIT_READY</promise>
           ")
+
+          # Extract just the commit message (before the promise)
+          COMMIT_MSG=$(echo "$COMMIT_MSG" | sed 's/<promise>.*<\/promise>//' | xargs)
 
           git add -A
           git commit -m "$COMMIT_MSG"
           git push -u origin "${{ env.BRANCH_NAME }}"
+
+          # Determine iteration note
+          if [[ "$ATTEMPTS" == "1" ]]; then
+            ITERATION_NOTE="✅ Approved on first attempt"
+          else
+            ITERATION_NOTE="🔄 Approved after $ATTEMPTS attempts (Ralph-style retry)"
+          fi
 
           gh pr create \
             --title "Fix #${{ env.ISSUE_NUMBER }}: $ISSUE_TITLE" \
@@ -263,11 +374,10 @@ jobs:
           ## Changes
           $DIFF_SUMMARY
 
-          ## Pipeline
-          - ✅ Issue Analyst: Researched codebase
-          - ✅ Writer Agent: Implemented minimal fix
-          - ✅ Reviewer Agent: Approved changes
-          - ✅ Committer Agent: Created this PR
+          ## Pipeline Results
+          - **Issue Analyst:** ✅ Research complete
+          - **Writer-Reviewer Loop:** $ITERATION_NOTE
+          - **Committer Agent:** ✅ PR created
 
           ## Next Steps
           1. Review this PR
@@ -278,21 +388,31 @@ jobs:
           Related to #${{ env.ISSUE_NUMBER }}
 
           ---
-          🤖 Generated by Claude Agent Pipeline" \
+          🤖 Generated by Claude Agent Pipeline (with Ralph-style retry loop)" \
             --base develop
 
+          echo "<promise>PR_CREATED</promise>"
+
       # ========================================
-      # HANDLE REJECTION
+      # HANDLE MAX RETRIES EXHAUSTED
       # ========================================
-      - name: Handle Rejection
-        if: steps.review.outputs.approved == 'false' && steps.review.outputs.reason != 'no_changes'
+      - name: Handle Retry Exhaustion
+        if: steps.write_review.outputs.approved == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh issue comment ${{ env.ISSUE_NUMBER }} --body "🤖 **Agent Pipeline Failed**
+          gh issue comment ${{ env.ISSUE_NUMBER }} --body "🤖 **Agent Pipeline Failed After ${{ env.MAX_WRITER_ATTEMPTS }} Attempts**
 
-          The Reviewer Agent rejected the changes:
+          The Writer-Reviewer loop could not produce approved changes.
 
-          > ${{ steps.review.outputs.reason }}
+          **Final Feedback:**
+          > ${{ steps.write_review.outputs.final_feedback }}
 
-          Please refine the issue requirements or add more details."
+          **Possible Actions:**
+          1. Simplify the issue requirements
+          2. Add more specific acceptance criteria
+          3. Break into smaller issues
+          4. Handle manually
+
+          ---
+          🔄 Ralph-style retry loop exhausted"
