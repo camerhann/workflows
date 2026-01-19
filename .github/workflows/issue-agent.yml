@@ -15,10 +15,6 @@ on:
 
 jobs:
   work-on-issue:
-    # Condition is handled by the caller workflow (for workflow_call) or by direct trigger filtering
-    if: >-
-      contains(github.event.issue.labels.*.name, 'agent') ||
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude-agent'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
