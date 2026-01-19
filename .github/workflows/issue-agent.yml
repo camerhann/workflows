@@ -1,10 +1,17 @@
-name: Issue Agent
+name: Issue Agent (Reusable)
 
 on:
+  # Direct triggers (for workflows repo itself)
   issues:
     types: [opened, labeled]
   issue_comment:
     types: [created]
+
+  # Reusable workflow trigger (for other repos)
+  workflow_call:
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
 
 jobs:
   work-on-issue:
