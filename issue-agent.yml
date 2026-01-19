@@ -1,0 +1,289 @@
+name: Issue Agent
+
+on:
+  issues:
+    types: [opened, labeled]
+  issue_comment:
+    types: [created]
+
+jobs:
+  work-on-issue:
+    if: |
+      (github.event_name == 'issues' && contains(github.event.issue.labels.*.name, 'agent')) ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude-agent'))
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Configure Git
+        run: |
+          git config user.name "Claude Agent"
+          git config user.email "claude-agent@users.noreply.github.com"
+
+      - name: Setup Branch
+        run: |
+          ISSUE_NUMBER=${{ github.event.issue.number }}
+          BRANCH_NAME="agent/issue-${ISSUE_NUMBER}"
+          git checkout -b "$BRANCH_NAME"
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+          echo "ISSUE_NUMBER=$ISSUE_NUMBER" >> $GITHUB_ENV
+
+      - name: Get Issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue view ${{ github.event.issue.number }} --json title,body > issue.json
+
+      # ========================================
+      # STEP 1: ISSUE ANALYST
+      # ========================================
+      - name: Issue Analyst
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE_TITLE=$(jq -r '.title' issue.json)
+          ISSUE_BODY=$(jq -r '.body' issue.json)
+
+          claude --print "
+          You are the ISSUE ANALYST. Your job is to research the codebase and create a clear brief.
+
+          ## Core Philosophy
+          The Writer should never have to guess what to do.
+
+          ## Issue #${{ env.ISSUE_NUMBER }}
+          **Title:** $ISSUE_TITLE
+          **Description:** $ISSUE_BODY
+
+          ## Your Tasks
+          1. Research the codebase - find relevant files, patterns, and existing implementations
+          2. Identify which files need to be modified
+          3. Find existing patterns to follow (search for similar implementations)
+          4. Create a file called ANALYSIS.md with:
+             - Relevant files (table with file path, purpose, action needed)
+             - Existing patterns to follow
+             - Must Do requirements
+             - Must NOT Do boundaries
+             - Scope estimate (SMALL/MEDIUM/LARGE)
+
+          ## Constraints
+          - Do NOT write any code yet
+          - Do NOT modify any source files
+          - ONLY create ANALYSIS.md with your findings
+          - Be specific - vague briefs lead to wrong solutions
+          "
+
+      # ========================================
+      # STEP 2: WRITER AGENT
+      # ========================================
+      - name: Writer Agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          ISSUE_TITLE=$(jq -r '.title' issue.json)
+          ISSUE_BODY=$(jq -r '.body' issue.json)
+
+          # Read analysis if it exists
+          ANALYSIS=""
+          if [[ -f ANALYSIS.md ]]; then
+            ANALYSIS=$(cat ANALYSIS.md)
+          fi
+
+          claude --print "
+          You are the WRITER AGENT. Your job is to make SURGICAL, MINIMAL changes.
+
+          ## Core Philosophy
+          The best code change is the smallest one that solves the problem.
+          - The existing codebase is the authority - learn from it, don't fight it
+          - Every line you add should earn its place
+          - If the existing code does something a certain way, do it that way too
+
+          ## Issue #${{ env.ISSUE_NUMBER }}
+          **Title:** $ISSUE_TITLE
+          **Description:** $ISSUE_BODY
+
+          ## Analysis from Issue Analyst
+          $ANALYSIS
+
+          ## Your Tasks
+          1. Study the existing code patterns BEFORE writing anything
+          2. Make the MINIMUM viable change that solves the issue
+          3. Match existing code style exactly
+          4. Save your changes (do NOT commit)
+
+          ## Constraints
+          - Do NOT commit your changes
+          - Do NOT refactor existing code unless required
+          - Do NOT add features beyond what the issue requests
+          - Do NOT improve code style in files you're touching
+          - When in doubt, do less
+
+          ## Self-Review Checklist (verify before finishing)
+          - Are changes the smallest possible?
+          - Did you follow existing patterns?
+          - Does your code look like it belongs?
+          "
+
+          # Clean up analysis file
+          rm -f ANALYSIS.md
+
+      # ========================================
+      # STEP 3: REVIEWER AGENT
+      # ========================================
+      - name: Reviewer Agent
+        id: review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          git diff > changes.diff
+
+          if [[ ! -s changes.diff ]]; then
+            echo "No changes to review"
+            echo "approved=false" >> $GITHUB_OUTPUT
+            echo "reason=no_changes" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          claude --print "
+          You are the REVIEWER AGENT. You are the QUALITY GATEKEEPER.
+
+          ## Core Philosophy
+          Nothing gets through unless it's verified.
+          - You don't trust - you verify
+          - If anything looks wrong, REJECT immediately
+
+          ## Changes to Review
+          $(cat changes.diff)
+
+          ## Your Tasks
+          1. Review the code changes
+          2. Check for bugs, security issues, logic errors
+          3. Verify changes are minimal and focused
+          4. Check that existing patterns were followed
+
+          ## Judgment
+          Create a file called REVIEW_RESULT.txt containing ONLY one of:
+          - APPROVED
+          - REJECTED: [specific reason]
+
+          ## REJECT if ANY of these are true:
+          - Changes are bloated or unfocused
+          - Bugs or security issues found
+          - Doesn't solve the actual issue
+          - Introduces unnecessary complexity
+
+          ## APPROVE only if ALL are true:
+          - Changes are minimal and focused
+          - Solution solves the issue
+          - No obvious bugs or security issues
+          - Follows existing codebase patterns
+          "
+
+          if [[ -f REVIEW_RESULT.txt ]]; then
+            RESULT=$(cat REVIEW_RESULT.txt)
+            echo "Review result: $RESULT"
+            if [[ "$RESULT" == REJECTED* ]]; then
+              echo "approved=false" >> $GITHUB_OUTPUT
+              echo "reason=$RESULT" >> $GITHUB_OUTPUT
+            else
+              echo "approved=true" >> $GITHUB_OUTPUT
+            fi
+            rm -f REVIEW_RESULT.txt
+          else
+            # Default to approved if no explicit rejection
+            echo "approved=true" >> $GITHUB_OUTPUT
+          fi
+
+      # ========================================
+      # STEP 4: COMMITTER AGENT
+      # ========================================
+      - name: Committer Agent
+        if: steps.review.outputs.approved == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [[ -z $(git status --porcelain) ]]; then
+            gh issue comment ${{ env.ISSUE_NUMBER }} --body "🤖 Analyzed the issue but couldn't determine what changes to make. Please provide more details."
+            exit 0
+          fi
+
+          ISSUE_TITLE=$(jq -r '.title' issue.json)
+
+          # Get a smart commit message from Claude
+          git diff --staged > /dev/null 2>&1 || git add -A
+          DIFF_SUMMARY=$(git diff --cached --stat)
+
+          COMMIT_MSG=$(claude --print "
+          Generate a conventional commit message for these changes.
+
+          Issue: #${{ env.ISSUE_NUMBER }} - $ISSUE_TITLE
+
+          Changes:
+          $DIFF_SUMMARY
+
+          Rules:
+          - Use format: type(scope): description
+          - Types: feat, fix, refactor, style, docs, test, chore
+          - Be specific, not generic
+          - End with: Closes #${{ env.ISSUE_NUMBER }}
+
+          Output ONLY the commit message, nothing else.
+          ")
+
+          git add -A
+          git commit -m "$COMMIT_MSG"
+          git push -u origin "${{ env.BRANCH_NAME }}"
+
+          gh pr create \
+            --title "Fix #${{ env.ISSUE_NUMBER }}: $ISSUE_TITLE" \
+            --body "## Summary
+          Automated fix for #${{ env.ISSUE_NUMBER }}
+
+          ## Changes
+          $DIFF_SUMMARY
+
+          ## Pipeline
+          - ✅ Issue Analyst: Researched codebase
+          - ✅ Writer Agent: Implemented minimal fix
+          - ✅ Reviewer Agent: Approved changes
+          - ✅ Committer Agent: Created this PR
+
+          Closes #${{ env.ISSUE_NUMBER }}
+
+          ---
+          🤖 Generated by Claude Agent Pipeline" \
+            --base main
+
+      # ========================================
+      # HANDLE REJECTION
+      # ========================================
+      - name: Handle Rejection
+        if: steps.review.outputs.approved == 'false' && steps.review.outputs.reason != 'no_changes'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment ${{ env.ISSUE_NUMBER }} --body "🤖 **Agent Pipeline Failed**
+
+          The Reviewer Agent rejected the changes:
+
+          > ${{ steps.review.outputs.reason }}
+
+          Please refine the issue requirements or add more details."
