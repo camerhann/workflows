@@ -84,12 +84,46 @@ jobs:
           1. Research the codebase - find relevant files, patterns, and existing implementations
           2. Identify which files need to be modified
           3. Find existing patterns to follow (search for similar implementations)
-          4. Create a file called ANALYSIS.md with:
+          4. **Classify the issue type** and identify test requirements
+          5. Create a file called ANALYSIS.md with:
+             - Issue type (BUG_FIX, NEW_FEATURE, or REFACTOR_STYLE)
              - Relevant files (table with file path, purpose, action needed)
              - Existing patterns to follow
              - Must Do requirements
              - Must NOT Do boundaries
              - Scope estimate (SMALL/MEDIUM/LARGE)
+             - **Test Requirement section** (see below)
+
+          ## Issue Type Classification
+          - **BUG_FIX**: Something is broken and needs fixing
+          - **NEW_FEATURE**: Adding new functionality
+          - **REFACTOR_STYLE**: Code cleanup, no behavior change (NO test required)
+
+          ## Test Requirement Section (REQUIRED in ANALYSIS.md)
+          For BUG_FIX:
+          \`\`\`
+          ### Test Requirement
+          **Type:** BUG_FIX - Test required
+          **Test location:** [path to existing test file, or new file if none exists]
+          **Test description:** Write a regression test that would have caught this bug
+          **What to test:** [specific behavior that was broken]
+          \`\`\`
+
+          For NEW_FEATURE:
+          \`\`\`
+          ### Test Requirement
+          **Type:** NEW_FEATURE - Test required
+          **Test location:** [path to test file]
+          **Test description:** Write a test that proves the feature works
+          **What to test:** [the happy path of the new feature]
+          \`\`\`
+
+          For REFACTOR_STYLE:
+          \`\`\`
+          ### Test Requirement
+          **Type:** REFACTOR_STYLE - No new test required
+          **Note:** Existing tests must still pass
+          \`\`\`
 
           ## Constraints
           - Do NOT write any code yet
@@ -182,6 +216,7 @@ jobs:
             - The existing codebase is the authority - learn from it, don't fight it
             - Every line you add should earn its place
             - If the existing code does something a certain way, do it that way too
+            - **Untested code is incomplete code** - a fix without a test is not done
             ${PREVIOUS_FEEDBACK:+- **IMPORTANT:** Address the reviewer feedback above!}
 
             ## Issue #${{ env.ISSUE_NUMBER }}
@@ -195,20 +230,33 @@ jobs:
             1. Study the existing code patterns BEFORE writing anything
             2. Make the MINIMUM viable change that solves the issue
             3. Match existing code style exactly
-            4. Save your changes (do NOT commit)
-            ${PREVIOUS_FEEDBACK:+5. **Address reviewer feedback from previous attempt**}
+            4. **Write ONE test if required** (see Test Requirement section in Analysis)
+               - For BUG_FIX: Write a regression test that catches the bug
+               - For NEW_FEATURE: Write a test that proves the feature works
+               - For REFACTOR_STYLE: No new test needed (existing tests must pass)
+            5. Save your changes (do NOT commit)
+            ${PREVIOUS_FEEDBACK:+6. **Address reviewer feedback from previous attempt**}
+
+            ## Test Guidelines
+            - Write exactly ONE focused test - not a test suite
+            - Test the specific thing that was fixed or added
+            - Follow existing test patterns in the codebase
+            - Place test in the location specified by the Analyst
+            - The test IS part of the minimum viable change
 
             ## Constraints
             - Do NOT commit your changes
             - Do NOT refactor existing code unless required
             - Do NOT add features beyond what the issue requests
             - Do NOT improve code style in files you're touching
+            - Do NOT write multiple tests - just ONE that proves your change works
             - When in doubt, do less
 
             ## Self-Review Checklist (verify before finishing)
             - Are changes the smallest possible?
             - Did you follow existing patterns?
             - Does your code look like it belongs?
+            - If BUG_FIX or NEW_FEATURE: Did you write ONE test?
             ${PREVIOUS_FEEDBACK:+- Did you address the reviewer feedback?}
 
             ## Completion Signal
@@ -241,10 +289,14 @@ jobs:
             - You don't trust - you verify
             - If anything looks wrong, REJECT with specific, actionable feedback
             - Your feedback will be given to Writer for the next attempt
+            - **A fix without a test is not complete** (for bugs and features)
 
             ## Issue Being Solved
             **Title:** $ISSUE_TITLE
             **Description:** $ISSUE_BODY
+
+            ## Analysis from Issue Analyst
+            $ANALYSIS
 
             ## Changes to Review
             \`\`\`diff
@@ -256,6 +308,16 @@ jobs:
             2. Check for bugs, security issues, logic errors
             3. Verify changes are minimal and focused
             4. Check that existing patterns were followed
+            5. **Verify test requirement is met** (see below)
+
+            ## Test Verification
+            Check the 'Test Requirement' section in the Analysis above:
+            - If **BUG_FIX**: There MUST be a test that would catch the bug
+            - If **NEW_FEATURE**: There MUST be a test that proves the feature works
+            - If **REFACTOR_STYLE**: No new test required
+
+            If a test is required but missing, REJECT with:
+            'Missing required test. This is a [BUG_FIX/NEW_FEATURE] - write ONE test that [specific guidance].'
 
             ## Judgment - Output EXACTLY ONE of these:
 
@@ -271,12 +333,14 @@ jobs:
             - Doesn't solve the actual issue
             - Introduces unnecessary complexity
             - Doesn't follow existing codebase patterns
+            - **Missing required test** (for BUG_FIX or NEW_FEATURE)
 
             ## APPROVE only if ALL are true:
             - Changes are minimal and focused
             - Solution solves the issue
             - No obvious bugs or security issues
             - Follows existing codebase patterns
+            - **Test requirement is satisfied** (if applicable)
             ")
 
             echo "$REVIEWER_OUTPUT"
@@ -375,8 +439,9 @@ jobs:
           $DIFF_SUMMARY
 
           ## Pipeline Results
-          - **Issue Analyst:** ✅ Research complete
+          - **Issue Analyst:** ✅ Research complete (with test requirements)
           - **Writer-Reviewer Loop:** $ITERATION_NOTE
+          - **Test Coverage:** ✅ Test included (if required for issue type)
           - **Committer Agent:** ✅ PR created
 
           ## Next Steps
@@ -388,7 +453,7 @@ jobs:
           Related to #${{ env.ISSUE_NUMBER }}
 
           ---
-          🤖 Generated by Claude Agent Pipeline (with Ralph-style retry loop)" \
+          🤖 Generated by Claude Agent Pipeline (with test-what-you-touch policy)" \
             --base develop
 
           echo "<promise>PR_CREATED</promise>"
