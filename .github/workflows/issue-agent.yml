@@ -1,4 +1,4 @@
-# Issue Agent - 4-Agent AI Pipeline with Ralph-Style Retry Loop
+# Issue Agent - 6-Agent AI Pipeline with Build Verification
 name: Issue Agent (Reusable)
 
 on:
@@ -56,22 +56,97 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh issue view ${{ github.event.issue.number }} --json title,body > issue.json
+          gh issue view ${{ github.event.issue.number }} --json title,body,labels > issue.json
 
       # ========================================
-      # STEP 1: ISSUE ANALYST (with Promise)
+      # STEP 1: TRIAGE (Quick scope assessment)
+      # ========================================
+      - name: Triage Assessment
+        id: triage
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          ISSUE_TITLE=$(jq -r '.title' issue.json)
+          ISSUE_BODY=$(jq -r '.body' issue.json)
+          ISSUE_LABELS=$(jq -r '.labels[].name' issue.json 2>/dev/null | tr '\n' ',' || echo "none")
+
+          OUTPUT=$(claude --print --dangerously-skip-permissions "
+          You are the TRIAGE AGENT. Quickly assess if this issue is suitable for autonomous fixing.
+
+          ## Issue #${{ env.ISSUE_NUMBER }}
+          **Title:** $ISSUE_TITLE
+          **Description:** $ISSUE_BODY
+          **Labels:** $ISSUE_LABELS
+
+          ## Assessment Criteria
+          SUITABLE for autonomous fix:
+          - Clear requirements
+          - Small to medium scope (1-5 files)
+          - No security-sensitive changes
+          - No major architectural decisions
+
+          NOT SUITABLE - needs human:
+          - Vague requirements
+          - Large scope (6+ files)
+          - Security/auth changes
+          - Database schema changes
+          - Breaking API changes
+
+          ## Output
+          Assess and output EXACTLY ONE of:
+          <promise>PROCEED: [SMALL/MEDIUM] - [brief reason]</promise>
+          <promise>ESCALATE: [reason why human needed]</promise>
+          ")
+
+          echo "$OUTPUT"
+
+          if echo "$OUTPUT" | grep -q "<promise>PROCEED:"; then
+            SCOPE=$(echo "$OUTPUT" | grep -o '<promise>PROCEED: [^<]*</promise>' | sed 's/<promise>PROCEED: //' | sed 's/<\/promise>//' | cut -d'-' -f1 | xargs)
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            echo "scope=$SCOPE" >> $GITHUB_OUTPUT
+          else
+            REASON=$(echo "$OUTPUT" | grep -o '<promise>ESCALATE: [^<]*</promise>' | sed 's/<promise>ESCALATE: //' | sed 's/<\/promise>//')
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=$REASON" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Handle Triage Escalation
+        if: steps.triage.outputs.proceed == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment ${{ env.ISSUE_NUMBER }} --body "## Triage Assessment
+
+          **Decision:** Needs Human Review
+
+          **Reason:**
+          > ${{ steps.triage.outputs.reason }}
+
+          This issue has been flagged for manual handling. Please either:
+          1. Simplify the requirements
+          2. Break into smaller issues
+          3. Handle manually
+
+          ---
+          *Issue Agent Triage*"
+          exit 0
+
+      # ========================================
+      # STEP 2: ISSUE ANALYST
       # ========================================
       - name: Issue Analyst
         id: analyst
+        if: steps.triage.outputs.proceed == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           ISSUE_TITLE=$(jq -r '.title' issue.json)
           ISSUE_BODY=$(jq -r '.body' issue.json)
+          SCOPE="${{ steps.triage.outputs.scope }}"
 
           OUTPUT=$(claude --print --dangerously-skip-permissions "
-          You are the ISSUE ANALYST. Your job is to research the codebase and create a clear brief.
+          You are the ISSUE ANALYST. Research the codebase and create a clear brief.
 
           ## Core Philosophy
           The Writer should never have to guess what to do.
@@ -79,33 +154,34 @@ jobs:
           ## Issue #${{ env.ISSUE_NUMBER }}
           **Title:** $ISSUE_TITLE
           **Description:** $ISSUE_BODY
+          **Triage Scope:** $SCOPE
 
           ## Your Tasks
-          1. Research the codebase - find relevant files, patterns, and existing implementations
+          1. Research the codebase - find relevant files, patterns, existing implementations
           2. Identify which files need to be modified
-          3. Find existing patterns to follow (search for similar implementations)
+          3. Find existing patterns to follow
           4. **Classify the issue type** and identify test requirements
-          5. Create a file called ANALYSIS.md with:
+          5. Create ANALYSIS.md with:
              - Issue type (BUG_FIX, NEW_FEATURE, or REFACTOR_STYLE)
-             - Relevant files (table with file path, purpose, action needed)
+             - Relevant files (table with file path, purpose, action)
              - Existing patterns to follow
              - Must Do requirements
              - Must NOT Do boundaries
              - Scope estimate (SMALL/MEDIUM/LARGE)
-             - **Test Requirement section** (see below)
+             - **Test Requirement section**
 
           ## Issue Type Classification
-          - **BUG_FIX**: Something is broken and needs fixing
-          - **NEW_FEATURE**: Adding new functionality
-          - **REFACTOR_STYLE**: Code cleanup, no behavior change (NO test required)
+          - **BUG_FIX**: Something is broken → ONE regression test required
+          - **NEW_FEATURE**: Adding new functionality → ONE happy-path test required
+          - **REFACTOR_STYLE**: Code cleanup, no behavior change → No new test
 
           ## Test Requirement Section (REQUIRED in ANALYSIS.md)
           For BUG_FIX:
           \`\`\`
           ### Test Requirement
           **Type:** BUG_FIX - Test required
-          **Test location:** [path to existing test file, or new file if none exists]
-          **Test description:** Write a regression test that would have caught this bug
+          **Test location:** [path to existing test file, or new file]
+          **Test description:** Regression test that would have caught this bug
           **What to test:** [specific behavior that was broken]
           \`\`\`
 
@@ -114,8 +190,8 @@ jobs:
           ### Test Requirement
           **Type:** NEW_FEATURE - Test required
           **Test location:** [path to test file]
-          **Test description:** Write a test that proves the feature works
-          **What to test:** [the happy path of the new feature]
+          **Test description:** Test that proves the feature works
+          **What to test:** [the happy path]
           \`\`\`
 
           For REFACTOR_STYLE:
@@ -132,16 +208,15 @@ jobs:
           - Be specific - vague briefs lead to wrong solutions
 
           ## Completion Signal
-          When ANALYSIS.md is complete and thorough, output exactly:
+          When ANALYSIS.md is complete, output exactly:
           <promise>ANALYSIS_COMPLETE</promise>
 
-          If you cannot complete analysis (missing info, unclear requirements), output:
+          If blocked (missing info, unclear requirements), output:
           <promise>ANALYSIS_BLOCKED: [reason]</promise>
           ")
 
           echo "$OUTPUT"
 
-          # Check for promise signals
           if echo "$OUTPUT" | grep -q "<promise>ANALYSIS_COMPLETE</promise>"; then
             echo "status=complete" >> $GITHUB_OUTPUT
           elif echo "$OUTPUT" | grep -q "<promise>ANALYSIS_BLOCKED"; then
@@ -149,7 +224,7 @@ jobs:
             echo "status=blocked" >> $GITHUB_OUTPUT
             echo "reason=$BLOCK_REASON" >> $GITHUB_OUTPUT
           else
-            echo "status=complete" >> $GITHUB_OUTPUT  # Default to complete for backwards compat
+            echo "status=complete" >> $GITHUB_OUTPUT
           fi
 
       - name: Handle Analyst Block
@@ -157,7 +232,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh issue comment ${{ env.ISSUE_NUMBER }} --body "🤖 **Issue Analyst Blocked**
+          gh issue comment ${{ env.ISSUE_NUMBER }} --body "## Issue Analyst Blocked
 
           Could not complete analysis:
           > ${{ steps.analyst.outputs.reason }}
@@ -166,35 +241,33 @@ jobs:
           exit 1
 
       # ========================================
-      # STEP 2 & 3: WRITER-REVIEWER RETRY LOOP
-      # Ralph-style iteration with feedback
+      # STEP 3, 4, 5: WRITER → BUILDER → REVIEWER LOOP
       # ========================================
-      - name: Writer-Reviewer Loop
-        id: write_review
+      - name: Writer-Builder-Reviewer Loop
+        id: write_build_review
+        if: steps.analyst.outputs.status == 'complete'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           ISSUE_TITLE=$(jq -r '.title' issue.json)
           ISSUE_BODY=$(jq -r '.body' issue.json)
 
-          # Read analysis
           ANALYSIS=""
           if [[ -f ANALYSIS.md ]]; then
             ANALYSIS=$(cat ANALYSIS.md)
           fi
 
-          # Initialize feedback for first iteration
           PREVIOUS_FEEDBACK=""
           ATTEMPT=1
           APPROVED=false
 
-          # ====== RALPH-STYLE RETRY LOOP ======
+          # ====== MAIN RETRY LOOP ======
           while [[ $ATTEMPT -le ${{ env.MAX_WRITER_ATTEMPTS }} ]]; do
             echo "=========================================="
-            echo "🔄 ATTEMPT $ATTEMPT of ${{ env.MAX_WRITER_ATTEMPTS }}"
+            echo "ATTEMPT $ATTEMPT of ${{ env.MAX_WRITER_ATTEMPTS }}"
             echo "=========================================="
 
-            # Reset changes if this is a retry
+            # Reset changes if retry
             if [[ $ATTEMPT -gt 1 ]]; then
               echo "Resetting changes for retry..."
               git checkout -- . 2>/dev/null || true
@@ -205,59 +278,49 @@ jobs:
             echo ">>> Running Writer Agent..."
 
             WRITER_OUTPUT=$(claude --print --dangerously-skip-permissions "
-            You are the WRITER AGENT. Your job is to make SURGICAL, MINIMAL changes.
+            You are the WRITER AGENT. Make SURGICAL, MINIMAL changes.
 
             ## Iteration Info
             **Attempt:** $ATTEMPT of ${{ env.MAX_WRITER_ATTEMPTS }}
-            ${PREVIOUS_FEEDBACK:+**Previous Rejection Feedback:** $PREVIOUS_FEEDBACK}
+            ${PREVIOUS_FEEDBACK:+**Previous Feedback:** $PREVIOUS_FEEDBACK}
 
             ## Core Philosophy
             The best code change is the smallest one that solves the problem.
-            - The existing codebase is the authority - learn from it, don't fight it
+            - The existing codebase is the authority
             - Every line you add should earn its place
-            - If the existing code does something a certain way, do it that way too
-            - **Untested code is incomplete code** - a fix without a test is not done
-            ${PREVIOUS_FEEDBACK:+- **IMPORTANT:** Address the reviewer feedback above!}
+            - **Untested code is incomplete code**
+            ${PREVIOUS_FEEDBACK:+- **IMPORTANT:** Address the feedback above!}
 
             ## Issue #${{ env.ISSUE_NUMBER }}
             **Title:** $ISSUE_TITLE
             **Description:** $ISSUE_BODY
 
-            ## Analysis from Issue Analyst
+            ## Analysis from Analyst
             $ANALYSIS
 
             ## Your Tasks
-            1. Study the existing code patterns BEFORE writing anything
-            2. Make the MINIMUM viable change that solves the issue
+            1. Study existing code patterns BEFORE writing
+            2. Make the MINIMUM viable change
             3. Match existing code style exactly
-            4. **Write ONE test if required** (see Test Requirement section in Analysis)
-               - For BUG_FIX: Write a regression test that catches the bug
-               - For NEW_FEATURE: Write a test that proves the feature works
-               - For REFACTOR_STYLE: No new test needed (existing tests must pass)
-            5. Save your changes (do NOT commit)
-            ${PREVIOUS_FEEDBACK:+6. **Address reviewer feedback from previous attempt**}
+            4. **Write ONE test if required** (see Test Requirement in Analysis)
+               - BUG_FIX: Regression test that catches the bug
+               - NEW_FEATURE: Test that proves the feature works
+               - REFACTOR_STYLE: No new test needed
+            5. Save changes (do NOT commit)
+            ${PREVIOUS_FEEDBACK:+6. **Address the feedback from previous attempt**}
 
             ## Test Guidelines
-            - Write exactly ONE focused test - not a test suite
-            - Test the specific thing that was fixed or added
-            - Follow existing test patterns in the codebase
-            - Place test in the location specified by the Analyst
-            - The test IS part of the minimum viable change
+            - Write exactly ONE focused test
+            - Test the specific thing fixed or added
+            - Follow existing test patterns
+            - Place in location specified by Analyst
 
             ## Constraints
-            - Do NOT commit your changes
-            - Do NOT refactor existing code unless required
-            - Do NOT add features beyond what the issue requests
-            - Do NOT improve code style in files you're touching
-            - Do NOT write multiple tests - just ONE that proves your change works
+            - Do NOT commit
+            - Do NOT refactor unrelated code
+            - Do NOT add features beyond the issue
+            - Do NOT write multiple tests
             - When in doubt, do less
-
-            ## Self-Review Checklist (verify before finishing)
-            - Are changes the smallest possible?
-            - Did you follow existing patterns?
-            - Does your code look like it belongs?
-            - If BUG_FIX or NEW_FEATURE: Did you write ONE test?
-            ${PREVIOUS_FEEDBACK:+- Did you address the reviewer feedback?}
 
             ## Completion Signal
             When done, output exactly:
@@ -266,12 +329,88 @@ jobs:
 
             echo "$WRITER_OUTPUT"
 
-            # Check if writer produced changes
+            # Check for changes
             git diff > changes.diff
             if [[ ! -s changes.diff ]]; then
               echo "No changes produced by Writer"
               ATTEMPT=$((ATTEMPT + 1))
               PREVIOUS_FEEDBACK="Writer produced no changes. Please make the necessary code modifications."
+              continue
+            fi
+
+            # ------ BUILDER AGENT ------
+            echo ">>> Running Builder Agent (build verification)..."
+
+            # Detect project type and run appropriate checks
+            BUILD_PASSED=true
+            BUILD_ERRORS=""
+
+            # Check for Python project
+            if [[ -f pyproject.toml ]] || [[ -f requirements.txt ]]; then
+              echo "Python project detected"
+
+              # Install dependencies if needed
+              if [[ -f requirements.txt ]]; then
+                pip install -r requirements.txt -q 2>/dev/null || true
+              fi
+
+              # Run pytest
+              if command -v pytest &> /dev/null; then
+                echo "Running pytest..."
+                if ! pytest --tb=short 2>&1 | tee test_output.txt; then
+                  BUILD_PASSED=false
+                  BUILD_ERRORS="Tests failed:\n$(tail -20 test_output.txt)"
+                fi
+              fi
+
+              # Run ruff/flake8 if available
+              if command -v ruff &> /dev/null; then
+                echo "Running ruff..."
+                if ! ruff check . 2>&1 | tee lint_output.txt; then
+                  BUILD_PASSED=false
+                  BUILD_ERRORS="${BUILD_ERRORS}\nLint errors:\n$(cat lint_output.txt)"
+                fi
+              fi
+            fi
+
+            # Check for Node.js project
+            if [[ -f package.json ]]; then
+              echo "Node.js project detected"
+
+              # Install dependencies
+              npm ci --silent 2>/dev/null || npm install --silent 2>/dev/null || true
+
+              # Run tests
+              if npm run test --if-present 2>&1 | tee test_output.txt; then
+                echo "Tests passed"
+              else
+                BUILD_PASSED=false
+                BUILD_ERRORS="Tests failed:\n$(tail -20 test_output.txt)"
+              fi
+
+              # Run lint
+              if npm run lint --if-present 2>&1 | tee lint_output.txt; then
+                echo "Lint passed"
+              else
+                BUILD_PASSED=false
+                BUILD_ERRORS="${BUILD_ERRORS}\nLint errors:\n$(tail -20 lint_output.txt)"
+              fi
+
+              # Run typecheck
+              if npm run typecheck --if-present 2>&1 | tee type_output.txt; then
+                echo "Type check passed"
+              else
+                BUILD_PASSED=false
+                BUILD_ERRORS="${BUILD_ERRORS}\nType errors:\n$(tail -20 type_output.txt)"
+              fi
+            fi
+
+            echo "Build passed: $BUILD_PASSED"
+
+            if [[ "$BUILD_PASSED" == "false" ]]; then
+              echo "Build failed, sending errors to Writer..."
+              PREVIOUS_FEEDBACK="Build verification failed:\n$BUILD_ERRORS\n\nPlease fix these issues."
+              ATTEMPT=$((ATTEMPT + 1))
               continue
             fi
 
@@ -287,16 +426,18 @@ jobs:
             ## Core Philosophy
             Nothing gets through unless it's verified.
             - You don't trust - you verify
-            - If anything looks wrong, REJECT with specific, actionable feedback
-            - Your feedback will be given to Writer for the next attempt
-            - **A fix without a test is not complete** (for bugs and features)
+            - If anything looks wrong, REJECT with specific feedback
+            - **A fix without a test is incomplete** (for bugs and features)
 
             ## Issue Being Solved
             **Title:** $ISSUE_TITLE
             **Description:** $ISSUE_BODY
 
-            ## Analysis from Issue Analyst
+            ## Analysis from Analyst
             $ANALYSIS
+
+            ## Build Status
+            All build checks PASSED (tests, lint, types)
 
             ## Changes to Review
             \`\`\`diff
@@ -307,65 +448,58 @@ jobs:
             1. Review the code changes
             2. Check for bugs, security issues, logic errors
             3. Verify changes are minimal and focused
-            4. Check that existing patterns were followed
-            5. **Verify test requirement is met** (see below)
+            4. Check existing patterns were followed
+            5. **Verify test requirement is met**
 
             ## Test Verification
-            Check the 'Test Requirement' section in the Analysis above:
-            - If **BUG_FIX**: There MUST be a test that would catch the bug
-            - If **NEW_FEATURE**: There MUST be a test that proves the feature works
-            - If **REFACTOR_STYLE**: No new test required
+            Check 'Test Requirement' section in Analysis:
+            - BUG_FIX: There MUST be a regression test
+            - NEW_FEATURE: There MUST be a feature test
+            - REFACTOR_STYLE: No new test required
 
-            If a test is required but missing, REJECT with:
-            'Missing required test. This is a [BUG_FIX/NEW_FEATURE] - write ONE test that [specific guidance].'
+            If test required but missing, REJECT.
 
-            ## Judgment - Output EXACTLY ONE of these:
-
+            ## Judgment - Output EXACTLY ONE:
             If APPROVED (all criteria met):
             <promise>APPROVED</promise>
 
-            If REJECTED (any issues found):
-            <promise>REJECTED: [specific, actionable feedback for Writer]</promise>
+            If REJECTED (any issues):
+            <promise>REJECTED: [specific, actionable feedback]</promise>
 
-            ## REJECT if ANY of these are true:
-            - Changes are bloated or unfocused
+            ## REJECT if ANY:
+            - Changes bloated or unfocused
             - Bugs or security issues found
-            - Doesn't solve the actual issue
-            - Introduces unnecessary complexity
-            - Doesn't follow existing codebase patterns
-            - **Missing required test** (for BUG_FIX or NEW_FEATURE)
+            - Doesn't solve the issue
+            - Missing required test
 
-            ## APPROVE only if ALL are true:
-            - Changes are minimal and focused
+            ## APPROVE only if ALL:
+            - Changes minimal and focused
             - Solution solves the issue
-            - No obvious bugs or security issues
-            - Follows existing codebase patterns
-            - **Test requirement is satisfied** (if applicable)
+            - No obvious bugs/security issues
+            - Test requirement satisfied
             ")
 
             echo "$REVIEWER_OUTPUT"
 
-            # Parse reviewer decision
+            # Parse decision
             if echo "$REVIEWER_OUTPUT" | grep -q "<promise>APPROVED</promise>"; then
-              echo "✅ APPROVED on attempt $ATTEMPT"
+              echo "APPROVED on attempt $ATTEMPT"
               APPROVED=true
               break
             elif echo "$REVIEWER_OUTPUT" | grep -q "<promise>REJECTED:"; then
               PREVIOUS_FEEDBACK=$(echo "$REVIEWER_OUTPUT" | grep -o '<promise>REJECTED: [^<]*</promise>' | sed 's/<promise>REJECTED: //' | sed 's/<\/promise>//')
-              echo "❌ REJECTED: $PREVIOUS_FEEDBACK"
-              echo "Will retry with feedback..."
+              echo "REJECTED: $PREVIOUS_FEEDBACK"
             else
-              # No clear signal, default to needing another attempt
               PREVIOUS_FEEDBACK="Reviewer did not provide clear approval. Please ensure changes are minimal and correct."
-              echo "⚠️ Unclear response, retrying..."
+              echo "Unclear response, retrying..."
             fi
 
             ATTEMPT=$((ATTEMPT + 1))
           done
           # ====== END RETRY LOOP ======
 
-          # Clean up
-          rm -f ANALYSIS.md changes.diff
+          # Cleanup
+          rm -f ANALYSIS.md changes.diff test_output.txt lint_output.txt type_output.txt
 
           # Set outputs
           if [[ "$APPROVED" == "true" ]]; then
@@ -378,23 +512,22 @@ jobs:
           fi
 
       # ========================================
-      # STEP 4: COMMITTER AGENT (with Promise)
+      # STEP 6: COMMITTER AGENT
       # ========================================
       - name: Committer Agent
-        if: steps.write_review.outputs.approved == 'true'
+        if: steps.write_build_review.outputs.approved == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           if [[ -z $(git status --porcelain) ]]; then
-            gh issue comment ${{ env.ISSUE_NUMBER }} --body "🤖 Analyzed the issue but couldn't determine what changes to make. Please provide more details."
+            gh issue comment ${{ env.ISSUE_NUMBER }} --body "Analyzed the issue but couldn't determine what changes to make. Please provide more details."
             exit 0
           fi
 
           ISSUE_TITLE=$(jq -r '.title' issue.json)
-          ATTEMPTS="${{ steps.write_review.outputs.attempts }}"
+          ATTEMPTS="${{ steps.write_build_review.outputs.attempts }}"
 
-          # Get a smart commit message from Claude
           git diff --staged > /dev/null 2>&1 || git add -A
           DIFF_SUMMARY=$(git diff --cached --stat)
 
@@ -416,18 +549,16 @@ jobs:
           Then output: <promise>COMMIT_READY</promise>
           ")
 
-          # Extract just the commit message (before the promise)
           COMMIT_MSG=$(echo "$COMMIT_MSG" | sed 's/<promise>.*<\/promise>//' | xargs)
 
           git add -A
           git commit -m "$COMMIT_MSG"
           git push -u origin "${{ env.BRANCH_NAME }}"
 
-          # Determine iteration note
           if [[ "$ATTEMPTS" == "1" ]]; then
-            ITERATION_NOTE="✅ Approved on first attempt"
+            ITERATION_NOTE="Approved on first attempt"
           else
-            ITERATION_NOTE="🔄 Approved after $ATTEMPTS attempts (Ralph-style retry)"
+            ITERATION_NOTE="Approved after $ATTEMPTS attempts"
           fi
 
           gh pr create \
@@ -439,45 +570,49 @@ jobs:
           $DIFF_SUMMARY
 
           ## Pipeline Results
-          - **Issue Analyst:** ✅ Research complete (with test requirements)
-          - **Writer-Reviewer Loop:** $ITERATION_NOTE
-          - **Test Coverage:** ✅ Test included (if required for issue type)
-          - **Committer Agent:** ✅ PR created
+          - **Triage:** Scope assessed
+          - **Analyst:** Research complete
+          - **Writer:** Changes implemented
+          - **Builder:** All checks pass
+          - **Reviewer:** $ITERATION_NOTE
+          - **Committer:** PR created
+
+          ## Test Coverage
+          Test included (if required for issue type)
 
           ## Next Steps
           1. Review this PR
           2. Merge to \`develop\` when approved
-          3. Manually merge \`develop\` → \`main\` when ready
-          4. Close issue #${{ env.ISSUE_NUMBER }} after merged to main
+          3. Issue #${{ env.ISSUE_NUMBER }} closes on merge
 
           Related to #${{ env.ISSUE_NUMBER }}
 
           ---
-          🤖 Generated by Claude Agent Pipeline (with test-what-you-touch policy)" \
+          Generated by Issue Agent Pipeline (6-agent architecture)" \
             --base develop
 
           echo "<promise>PR_CREATED</promise>"
 
       # ========================================
-      # HANDLE MAX RETRIES EXHAUSTED
+      # HANDLE FAILURES
       # ========================================
       - name: Handle Retry Exhaustion
-        if: steps.write_review.outputs.approved == 'false'
+        if: steps.write_build_review.outputs.approved == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh issue comment ${{ env.ISSUE_NUMBER }} --body "🤖 **Agent Pipeline Failed After ${{ env.MAX_WRITER_ATTEMPTS }} Attempts**
+          gh issue comment ${{ env.ISSUE_NUMBER }} --body "## Agent Pipeline Failed
 
-          The Writer-Reviewer loop could not produce approved changes.
+          **Attempts:** ${{ env.MAX_WRITER_ATTEMPTS }}
 
           **Final Feedback:**
-          > ${{ steps.write_review.outputs.final_feedback }}
+          > ${{ steps.write_build_review.outputs.final_feedback }}
 
-          **Possible Actions:**
+          **Suggestions:**
           1. Simplify the issue requirements
           2. Add more specific acceptance criteria
           3. Break into smaller issues
           4. Handle manually
 
           ---
-          🔄 Ralph-style retry loop exhausted"
+          *Issue Agent Pipeline*"
