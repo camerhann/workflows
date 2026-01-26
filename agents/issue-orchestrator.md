@@ -45,6 +45,42 @@ Issue → Triage → Analyst → Writer ⟷ Build ⟷ Reviewer → Committer
 /issue-orchestrator --status
 ```
 
+## CRITICAL: Automatic Agent Handoffs
+
+**YOU MUST automatically invoke the next agent after each step completes.** Do not wait for user input between agents. The pipeline should flow seamlessly:
+
+```
+1. Initialize state
+2. IMMEDIATELY invoke /issue-triage
+3. After triage completes → IMMEDIATELY invoke /issue-analyst
+4. After analyst completes → IMMEDIATELY invoke /issue-writer
+5. After writer completes → IMMEDIATELY invoke /issue-builder
+6. After builder passes → IMMEDIATELY invoke /issue-reviewer
+7. After reviewer approves → IMMEDIATELY invoke /issue-committer
+8. Done!
+```
+
+**After EVERY agent completes:**
+1. Read the updated `issue-state.json`
+2. Check for questions/escalations
+3. If none, IMMEDIATELY invoke the next agent using the Skill tool
+4. Do NOT report status and wait - keep the pipeline moving
+
+**The handoff sequence is:**
+```
+triage.completed=true     → invoke /issue-analyst
+analysis.completed=true   → invoke /issue-writer
+writer.completed=true     → invoke /issue-builder
+build.completed=true (pass) → invoke /issue-reviewer
+review.verdict=APPROVED   → invoke /issue-committer
+commit.completed=true     → Pipeline complete!
+```
+
+**On failures:**
+- build.completed=true but failed → update writer feedback, invoke /issue-writer (retry)
+- review.verdict=REJECTED → update writer feedback, invoke /issue-writer (retry)
+- Max retries exceeded → escalate to human
+
 ## Workflow
 
 ### 1. Initialize State
@@ -86,17 +122,17 @@ Create `issue-state.json`:
 }
 ```
 
-### 2. Run Triage (Optional)
+### 2. Run Triage
 
-For large or complex issues, run triage first:
+After initializing state, IMMEDIATELY invoke triage:
 
 ```
 /issue-triage
 ```
 
-Check result:
-- If `triage.should_proceed === false` → Comment on issue and stop
-- If `triage.scope === "LARGE"` → Flag for human review before proceeding
+**HANDOFF:** After triage completes, read state and:
+- If `triage.should_proceed === false` → Comment on issue and STOP
+- If `triage.should_proceed === true` → **IMMEDIATELY invoke `/issue-analyst`**
 
 ### 3. Run Analyst
 
@@ -111,14 +147,14 @@ The analyst will:
 - Create the analysis brief
 - Update `analysis` section of state
 
-**Check for completion:**
-- `analysis.completed === true` → Continue to Writer
-- `analysis.completed === false` with questions → Route questions
+**HANDOFF:** After analyst completes, read state and:
+- If `analysis.completed === true` → **IMMEDIATELY invoke `/issue-writer`**
+- If `analysis.completed === false` with questions → Route questions, then resume
 - Pipeline blocked → Escalate to human
 
 ### 4. Run Writer-Build-Reviewer Loop
 
-This is the core retry loop. Maximum 3 attempts.
+This is the core retry loop. Maximum 3 attempts. **Execute this as a continuous flow:**
 
 ```
 ATTEMPT = 1
@@ -126,27 +162,40 @@ while ATTEMPT <= 3:
 
     # Writer makes changes
     /issue-writer
+    # IMMEDIATELY after writer completes:
 
     # Build verifies changes compile and tests pass
     /issue-builder
+    # IMMEDIATELY after build completes:
 
     if build.tests_passed AND build.lint_passed:
         # Reviewer evaluates the solution
         /issue-reviewer
+        # IMMEDIATELY after reviewer completes:
 
         if review.verdict === "APPROVED":
-            break  # Exit loop, proceed to commit
+            break  # IMMEDIATELY proceed to committer
         else:
-            # Pass feedback to writer for next attempt
+            # Pass feedback to writer, IMMEDIATELY retry
             ATTEMPT += 1
     else:
-        # Build failed, pass errors to writer
+        # Build failed, pass errors to writer, IMMEDIATELY retry
         ATTEMPT += 1
 
 if ATTEMPT > 3:
     # Max retries exhausted
     Escalate to human
 ```
+
+**HANDOFF after Writer:** Read state, then **IMMEDIATELY invoke `/issue-builder`**
+
+**HANDOFF after Builder:**
+- If `build.tests_passed && build.lint_passed` → **IMMEDIATELY invoke `/issue-reviewer`**
+- If build failed → Update `writer.previous_feedback`, **IMMEDIATELY invoke `/issue-writer`** (retry)
+
+**HANDOFF after Reviewer:**
+- If `review.verdict === "APPROVED"` → **IMMEDIATELY invoke `/issue-committer`**
+- If rejected → Update `writer.previous_feedback`, increment attempt, **IMMEDIATELY invoke `/issue-writer`** (retry)
 
 ### 5. Run Committer
 
@@ -161,6 +210,8 @@ The committer will:
 - Push to the branch
 - Create a PR
 - Close the issue with a comment
+
+**HANDOFF after Committer:** Pipeline complete! Record learnings and report success.
 
 ### 6. Record Learnings
 
@@ -319,6 +370,30 @@ Waiting for reviewer verdict...
 - **Preserve state** - State file is the source of truth
 - **Escalate appropriately** - Know when humans need to step in
 - **Don't do agent work** - Route to agents, don't do their jobs
+- **NEVER wait for user input between agents** - Keep the pipeline moving automatically
+
+## Example: Full Automatic Execution
+
+When user runs `/issue-orchestrator 42`, execute this sequence without pausing:
+
+```
+1. Initialize state for issue #42
+2. Invoke: /issue-triage
+   → triage.completed=true, should_proceed=true
+3. Invoke: /issue-analyst 42
+   → analysis.completed=true
+4. Invoke: /issue-writer
+   → writer.completed=true
+5. Invoke: /issue-builder
+   → build.completed=true, tests_passed=true, lint_passed=true
+6. Invoke: /issue-reviewer
+   → review.verdict="APPROVED"
+7. Invoke: /issue-committer
+   → commit.completed=true
+8. Record learnings, report success
+```
+
+**All 7 agent invocations happen in ONE orchestrator run.** Do not stop and report between agents.
 
 ## Integration with Background Mode
 
